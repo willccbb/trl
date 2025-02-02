@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 from unittest.mock import patch
 
 import torch
@@ -49,8 +48,14 @@ from .utils import generate_model_card, get_comet_experiment_url, pad
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
+if TYPE_CHECKING:
+    from vllm import LLM, SamplingParams
+
 if is_vllm_available():
     from vllm import LLM, SamplingParams
+    InferenceLLM = Union[LLM, AutoModelForCausalLM]
+else:
+    InferenceLLM = AutoModelForCausalLM
 
 if is_wandb_available():
     import wandb
@@ -142,6 +147,8 @@ class GRPOTrainer(Trainer):
             model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
         peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
+
+        env (Callable[LLM], str], *optional*, defaults to `None`): 
     """
 
     _tag_names = ["trl", "grpo"]
@@ -158,6 +165,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        env: Optional[Any] = None,
     ):
         # Args
         if args is None:
@@ -243,6 +251,9 @@ class GRPOTrainer(Trainer):
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
 
+        # Environment (can be None)
+        self.env = env
+
         # Data collator
         def data_collator(features):  # No data collation is needed in GRPO
             return features
@@ -283,7 +294,6 @@ class GRPOTrainer(Trainer):
                     "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
                     "`pip install vllm` to use it."
                 )
-
             if self.accelerator.is_main_process:
                 vllm_device = self.args.vllm_device
                 if vllm_device == "auto":
@@ -367,23 +377,7 @@ class GRPOTrainer(Trainer):
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         return inputs
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if return_outputs:
-            raise ValueError("The GRPOTrainer does not support returning outputs")
-
-        device = self.accelerator.device
-        prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        prompt_inputs = self.processing_class(
-            prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-        )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
-
-        if self.max_prompt_length is not None:
-            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -self.max_prompt_length :]
-            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
-
-        # Generate completions using either vLLM or regular generation
+    def _sample_completions(self, model, prompt_inputs, prompts_text):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
@@ -406,8 +400,8 @@ class GRPOTrainer(Trainer):
             # corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
             process_slice = slice(
-                self.accelerator.process_index * len(prompts) * self.num_generations,
-                (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
+                self.accelerator.process_index * len(prompts_text) * self.num_generations,
+                (self.accelerator.process_index + 1) * len(prompts_text) * self.num_generations,
             )
             completion_ids = completion_ids[process_slice]
 
@@ -422,8 +416,32 @@ class GRPOTrainer(Trainer):
                 prompt_completion_ids = unwrapped_model.generate(
                     **prompt_inputs, generation_config=self.generation_config
                 )
+        return prompt_completion_ids
 
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if return_outputs:
+            raise ValueError("The GRPOTrainer does not support returning outputs")
+
+        device = self.accelerator.device
+
+        # text prompts
+        prompts = [x["prompt"] for x in inputs]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+
+        # tokenize prompts
+        prompt_inputs = self.processing_class(
+            prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        )
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+
+        # truncate prompts if necessary
+        if self.max_prompt_length is not None:
+            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -self.max_prompt_length :]
+            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
+
+        # Generate completions using either vLLM or regular generation (returns prompt_completion_ids)
         prompt_length = prompt_inputs["input_ids"].size(1)
+        prompt_completion_ids = self._sample_completions(model, prompt_inputs, prompts_text)
         completion_ids = prompt_completion_ids[:, prompt_length:]
 
         # Get the per-token log probabilities for the completions for the model and the reference model
