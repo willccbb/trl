@@ -377,7 +377,7 @@ class GRPOTrainer(Trainer):
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         return inputs
 
-    def _sample_completions(self, model, prompt_inputs, prompts_text):
+    def _sample_completions(self, model, prompt_inputs, prompts_text, device):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
@@ -441,7 +441,7 @@ class GRPOTrainer(Trainer):
 
         # Generate completions using either vLLM or regular generation (returns prompt_completion_ids)
         prompt_length = prompt_inputs["input_ids"].size(1)
-        prompt_completion_ids = self._sample_completions(model, prompt_inputs, prompts_text)
+        prompt_completion_ids = self._sample_completions(model, prompt_inputs, prompts_text, device)
         completion_ids = prompt_completion_ids[:, prompt_length:]
 
         # Get the per-token log probabilities for the completions for the model and the reference model
