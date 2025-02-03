@@ -396,8 +396,7 @@ class GRPOTrainer(Trainer):
                     outputs = self.env.generate(
                         all_prompts,
                         llm=self.llm,
-                        sampling_params=self.sampling_params,
-                        use_tqdm=False,
+                        sampling_params=self.sampling_params
                     )
                     completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
                 else:
