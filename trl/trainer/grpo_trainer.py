@@ -394,7 +394,7 @@ class GRPOTrainer(Trainer):
             if self.accelerator.is_main_process:
                 if self.env is not None:
                     outputs = self.env.generate(
-                        all_prompts,
+                        prompts=all_prompts,
                         llm=self.llm,
                         sampling_params=self.sampling_params
                     )
