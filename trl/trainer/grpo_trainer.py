@@ -377,7 +377,7 @@ class GRPOTrainer(Trainer):
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         return inputs
 
-    def _sample_completions(self, model, prompt_inputs, prompts_text, device):
+    def _sample_completions(self, model, prompts, prompt_inputs, prompts_text, device):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
@@ -390,9 +390,19 @@ class GRPOTrainer(Trainer):
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
+            all_prompts = gather_object(prompts)
             if self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                if self.env is not None:
+                    outputs = self.env.generate(
+                        all_prompts,
+                        llm=self.llm,
+                        sampling_params=self.sampling_params,
+                        use_tqdm=False,
+                    )
+                    completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                else:
+                    outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                    completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
                 completion_ids = [None] * len(all_prompts_text) * self.num_generations
 
@@ -441,7 +451,7 @@ class GRPOTrainer(Trainer):
 
         # Generate completions using either vLLM or regular generation (returns prompt_completion_ids)
         prompt_length = prompt_inputs["input_ids"].size(1)
-        prompt_completion_ids = self._sample_completions(model, prompt_inputs, prompts_text, device)
+        prompt_completion_ids = self._sample_completions(model, prompts, prompt_inputs, prompts_text, device)
         completion_ids = prompt_completion_ids[:, prompt_length:]
 
         # Get the per-token log probabilities for the completions for the model and the reference model
